@@ -1,0 +1,48 @@
+name: Package Foxglove Extension
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Build package
+        id: build_package
+        run: |
+          rm -f ./*.foxe
+          yarn package
+
+          artifact_path="$(find "$PWD" -maxdepth 1 -type f -name '*.foxe' | head -n 1)"
+          if [ -z "$artifact_path" ]; then
+            echo "No .foxe file was created" >&2
+            exit 1
+          fi
+
+          echo "artifact_path=$artifact_path" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$(basename "$artifact_path")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload package to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.build_package.outputs.artifact_path }}
