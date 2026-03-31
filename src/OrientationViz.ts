@@ -1,6 +1,6 @@
 import { ExtensionContext, Immutable, MessageEvent } from "@foxglove/extension";
 
-const DEFAULT_MARKER_OPACITY = 1.0;
+const DEFAULT_MARKER_OPACITY = 0.8;
 const TARGET_BUFFER_SECONDS = 600;
 const THINNING_SECONDS = 0.2;
 const THINNING_DISTANCE_METERS = 0.2;
@@ -28,10 +28,10 @@ type Marker = {
   points?: Point[];
 };
 type MarkerArray = { markers: Marker[] };
-type TimedPoint = { point: Point; timeSec: number };
 
 type TopicState = {
-  points: TimedPoint[];
+  points: Point[];
+  colorIndex: number;
   latest: OdometryMessage;
   lastAcceptedPoint?: Point;
   lastAcceptedTimeSec?: number;
@@ -99,6 +99,25 @@ function distanceMeters(a: Point, b: Point): number {
   const dy = a.y - b.y;
   const dz = a.z - b.z;
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function shouldAcceptTrajectoryPoint(
+  position: Point,
+  timestampSec: number | undefined,
+  state: TopicState,
+): boolean {
+  if (
+    timestampSec == undefined ||
+    state.lastAcceptedTimeSec == undefined ||
+    state.lastAcceptedPoint == undefined
+  ) {
+    return true;
+  }
+
+  return (
+    distanceMeters(position, state.lastAcceptedPoint) >= THINNING_DISTANCE_METERS &&
+    timestampSec - state.lastAcceptedTimeSec >= THINNING_SECONDS
+  );
 }
 
 function isZeroQuaternion(orientation: Quaternion): boolean {
@@ -169,8 +188,8 @@ function topicIdBase(topicName: string): number {
   return Math.abs(hash) % 1000000000;
 }
 
-function buildMarkersForTopic(topicName: string, state: TopicState, colorIndex: number): Marker[] {
-  const color = colorForTopic(colorIndex, DEFAULT_MARKER_OPACITY);
+function buildMarkersForTopic(topicName: string, state: TopicState): Marker[] {
+  const color = colorForTopic(state.colorIndex, DEFAULT_MARKER_OPACITY);
   const idBase = topicIdBase(topicName) * 3;
   const hasValidOrientation = !isZeroQuaternion(state.latest.pose.pose.orientation);
   const covariance = readCovarianceDiagonal(state.latest.pose.covariance);
@@ -182,21 +201,6 @@ function buildMarkersForTopic(topicName: string, state: TopicState, colorIndex: 
     x: Math.max(0.001, Math.sqrt(covarianceX) * 2),
     y: Math.max(0.001, Math.sqrt(covarianceY) * 2),
     z: Math.max(0.001, Math.sqrt(covarianceZ) * 2),
-  };
-
-  const trajectoryMarker: Marker = {
-    header: state.latest.header,
-    ns: "trajectory",
-    id: idBase,
-    type: 4,
-    action: 0,
-    pose: {
-      position: { x: 0, y: 0, z: 0 },
-      orientation: { x: 0, y: 0, z: 0, w: 1 },
-    },
-    scale: { x: 0.05, y: 0, z: 0 },
-    color,
-    points: state.points.map((item) => item.point),
   };
 
   const covarianceMarker: Marker = {
@@ -215,7 +219,26 @@ function buildMarkersForTopic(topicName: string, state: TopicState, colorIndex: 
     color: { ...color, a: 0.5 },
   };
 
-  const markers: Marker[] = [trajectoryMarker, covarianceMarker];
+  const markers: Marker[] = [];
+
+  if (state.points.length > 0) {
+    markers.push({
+      header: state.latest.header,
+      ns: "trajectory",
+      id: idBase,
+      type: 4,
+      action: 0,
+      pose: {
+        position: { x: 0, y: 0, z: 0 },
+        orientation: { x: 0, y: 0, z: 0, w: 1 },
+      },
+      scale: { x: 0.05, y: 0, z: 0 },
+      color,
+      points: state.points,
+    });
+  }
+
+  markers.push(covarianceMarker);
 
   const currentPoseMarker: Marker = {
     header: state.latest.header,
@@ -242,7 +265,6 @@ function createOdometryToMarkerArrayConverter(): (
   event: Immutable<MessageEvent>,
 ) => MarkerArray | undefined {
   const statesByTopic = new Map<string, TopicState>();
-  const topicOrder: string[] = [];
 
   return (msg: unknown, event: Immutable<MessageEvent>): MarkerArray | undefined => {
     if (!isOdometryMessage(msg)) {
@@ -250,7 +272,11 @@ function createOdometryToMarkerArrayConverter(): (
     }
 
     const topicName = event.topic;
-    const state = statesByTopic.get(topicName) ?? { points: [], latest: msg };
+    const state = statesByTopic.get(topicName) ?? {
+      points: [],
+      colorIndex: statesByTopic.size,
+      latest: msg,
+    };
     const timestampSec = headerStampToSeconds(msg.header.stamp);
 
     const position = msg.pose.pose.position;
@@ -264,31 +290,8 @@ function createOdometryToMarkerArrayConverter(): (
       state.lastAcceptedTimeSec = undefined;
     }
 
-    const canThin =
-      timestampSec != undefined &&
-      state.lastAcceptedTimeSec != undefined &&
-      state.lastAcceptedPoint != undefined;
-    const distanceFromLastAccepted =
-      state.lastAcceptedPoint != undefined
-        ? distanceMeters(position, state.lastAcceptedPoint)
-        : undefined;
-    const elapsedSinceAccepted =
-      timestampSec != undefined && state.lastAcceptedTimeSec != undefined
-        ? timestampSec - state.lastAcceptedTimeSec
-        : undefined;
-
-    const shouldAccept =
-      !canThin ||
-      distanceFromLastAccepted == undefined ||
-      elapsedSinceAccepted == undefined ||
-      (distanceFromLastAccepted >= THINNING_DISTANCE_METERS &&
-        elapsedSinceAccepted >= THINNING_SECONDS);
-
-    if (shouldAccept && timestampSec != undefined) {
-      state.points.push({
-        point: { x: position.x, y: position.y, z: position.z },
-        timeSec: timestampSec,
-      });
+    if (timestampSec != undefined && shouldAcceptTrajectoryPoint(position, timestampSec, state)) {
+      state.points.push({ x: position.x, y: position.y, z: position.z });
       if (state.points.length > MAX_TRAJECTORY_POINTS) {
         state.points.splice(0, state.points.length - MAX_TRAJECTORY_POINTS);
       }
@@ -297,22 +300,9 @@ function createOdometryToMarkerArrayConverter(): (
     }
 
     state.latest = msg;
-
-    if (!statesByTopic.has(topicName)) {
-      topicOrder.push(topicName);
-    }
     statesByTopic.set(topicName, state);
 
-    const markers: Marker[] = [];
-    topicOrder.forEach((name, index) => {
-      const currentState = statesByTopic.get(name);
-      if (!currentState || currentState.points.length === 0) {
-        return;
-      }
-      markers.push(...buildMarkersForTopic(name, currentState, index));
-    });
-
-    return { markers };
+    return { markers: buildMarkersForTopic(topicName, state) };
   };
 }
 
